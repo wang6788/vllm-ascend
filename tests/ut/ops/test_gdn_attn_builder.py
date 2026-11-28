@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
@@ -36,6 +36,7 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.glm5next.kda import Glm5NextGDNHostMetadataBuilder
 from vllm_ascend.models.glm5next.recoverssm_metadata import Glm5NextRecoverSSMMetadataBuilder
 from vllm_ascend.models.kimi_k3.recoverssm_metadata import AscendKimiKDARecoverSSMMetadataBuilder
+from vllm_ascend.ops.kimi_kda import KimiKDAHostMetadataBuilder
 from vllm_ascend.ops.triton.fla import utils as fla_utils
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices as runtime_prepare_chunk_indices,
@@ -49,6 +50,7 @@ from vllm_ascend.ops.triton.fla.utils import (
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_update_chunk_offsets as runtime_prepare_update_chunk_offsets,
 )
+from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 
 @pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
@@ -377,6 +379,272 @@ def _make_builder(
         num_speculative_blocks=num_speculative_blocks,
     )
     return builder_cls(spec, ["layer0"], vllm_config, device)
+
+
+def _assert_kda_metadata_equal(actual, expected, path="metadata"):
+    """Include the Ascend descriptors attached after the upstream dataclass constructor."""
+    assert type(actual) is type(expected), path
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=path)
+    elif is_dataclass(expected):
+        assert vars(actual).keys() == vars(expected).keys(), path
+        for name in vars(expected).keys() | {f.name for f in fields(expected)}:
+            _assert_kda_metadata_equal(getattr(actual, name), getattr(expected, name), f"{path}.{name}")
+    else:
+        assert actual == expected, path
+
+
+def _build_kimi_kda_group_batch(state, common, groups, tables, slots, count, mode, *, capture=False, pcp_context=None):
+    bucket = common.num_reqs
+    rows = bucket if mode == CUDAGraphMode.FULL else count
+    # Padded input queries still span the graph bucket on partially active and idle steps.
+    batch = SimpleNamespace(
+        num_reqs=count,
+        num_reqs_after_padding=bucket,
+        num_tokens=count,
+        num_tokens_after_padding=bucket,
+        max_query_len=common.max_query_len,
+        query_start_loc=common.query_start_loc[: rows + 1],
+        query_start_loc_np=common.query_start_loc_cpu[: rows + 1].numpy(),
+        seq_lens=common.seq_lens[:rows],
+        seq_lens_np=common.seq_lens_cpu[:rows].numpy(),
+        is_prefilling_np=common.is_prefilling.numpy(),
+        prefill_runs_as_decode_np=None,
+        dcp_local_seq_lens=None,
+        attn_state=None,
+        positions=None,
+        is_dummy=capture,
+    )
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=g[0].kv_cache_spec) for g in groups])
+    return AscendMambaHybridModelState._build_attn_metadata_for_batch(
+        state,
+        batch,
+        mode,
+        tables,
+        slots,
+        groups,
+        config,
+        capture,
+        use_pcp_padding=pcp_context is not None,
+        pcp_context=pcp_context,
+    )
+
+
+def test_kimi_kda_group_updates_match_independent_full_builds():
+    device = torch.device("cpu")
+    bucket = 8
+    num_groups = 69
+    names = [f"layer{i}" for i in range(num_groups)]
+    vllm_config = _make_vllm_config(
+        max_num_seqs=bucket, max_num_batched_tokens=bucket, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+    )
+    vllm_config.num_speculative_tokens = 0
+    vllm_config.compilation_config.static_forward_context = {
+        name: SimpleNamespace(use_contiguous_conv_indices=True) for name in names
+    }
+    spec = MambaSpec(block_size=16, shapes=((1,), (1,)), dtypes=(torch.float32, torch.float32))
+    builders = [KimiKDAHostMetadataBuilder(spec, [name], vllm_config, device) for name in names]
+    references = [KimiKDAHostMetadataBuilder(spec, [name], vllm_config, device) for name in names]
+    for reference in references:
+        reference.supports_update_block_table = False
+    groups = [
+        [AttentionGroup(None, [f"layer{i}"], builder.kv_cache_spec, i, metadata_builders=[builder])]
+        for i, builder in enumerate(builders)
+    ]
+    state = SimpleNamespace(vllm_config=vllm_config, max_model_len=64)
+    tables = [torch.zeros((bucket, 1), dtype=torch.int32) for _ in builders]
+    slots = torch.arange(num_groups * bucket, dtype=torch.int64).view(num_groups, bucket)
+    physical = torch.arange(1, num_groups * 16 + 1, dtype=torch.int32).view(num_groups, 16)
+    template = create_common_attn_metadata(BatchSpec([64] * bucket, [1] * bucket), spec.block_size, device)
+    captured = {}
+    steps = [list(range(bucket)), list(range(bucket)), [7, 1, 4], [], [15, 1, 7, 2, 9, 6, 4, 0]]
+    for step, order in enumerate(steps):
+        count = len(order)
+        capture = step == 0
+        if step == len(steps) - 1:
+            physical[:, 1] += 1_000  # Reuse a scheduler slot with a new state block.
+        for i, table in enumerate(tables):
+            table.zero_()
+            if not capture:
+                table[:count, 0] = physical[i, order]
+
+        mode = CUDAGraphMode.NONE if capture else CUDAGraphMode.FULL
+        with patch.object(
+            ascend_gdn_attn_builder, "_split_gdn_batch", wraps=ascend_gdn_attn_builder._split_gdn_batch
+        ) as split:
+            result = _build_kimi_kda_group_batch(state, template, groups, tables, slots, count, mode, capture=capture)
+        assert split.call_count == 1
+
+        if capture:
+            captured = result
+        leader = result["layer0"]
+        captured_lengths = captured["layer0"].non_spec_decode_metadata.actual_seq_lengths
+        assert captured_lengths.tolist() == [0] + [1] * count + [0] * (bucket - count)
+        for i, reference in enumerate(references):
+            common = replace(template, block_table_tensor=tables[i], slot_mapping=slots[i], num_actual_tokens=count)
+            expected = (
+                reference.build_for_cudagraph_capture(common)
+                if capture
+                else reference.build(0, common, num_actual_reqs=count)
+            )
+            name = f"layer{i}"
+            current = result[name]
+            _assert_kda_metadata_equal(current, expected)
+            assert current.non_spec_query_start_loc.data_ptr() == leader.non_spec_query_start_loc.data_ptr()
+            for metadata in (current, captured[name]):
+                assert metadata.non_spec_query_start_loc.tolist() == [min(row, count) for row in range(bucket + 1)]
+                indices = metadata.non_spec_state_indices_tensor
+                assert indices.data_ptr() == tables[i].data_ptr()
+                assert indices.is_contiguous()
+                assert torch.equal(indices, tables[i][:, 0])
+                decode = metadata.non_spec_decode_metadata
+                if decode is not None:
+                    assert decode.causal_conv1d.cache_indices.data_ptr() == indices.data_ptr()
+                    assert decode.causal_conv1d.query_start_loc.data_ptr() == leader.non_spec_query_start_loc.data_ptr()
+                    assert decode.actual_seq_lengths.data_ptr() == captured_lengths.data_ptr()
+
+
+@pytest.mark.parametrize("path", ["full", "eager", "pcp"])
+def test_kimi_kda_idle_lengths_only_clear_shared_graph_inputs(path):
+    device = torch.device("cpu")
+    rows = 2
+    config = _make_vllm_config(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)
+    config.num_speculative_tokens = 0
+    state = SimpleNamespace(vllm_config=config, max_model_len=64)
+    spec = MambaSpec(block_size=16, shapes=((1,), (1,)), dtypes=(torch.float32, torch.float32))
+    specs = {
+        "wide_table": spec,
+        "leader": spec,
+        "follower1": spec,
+        "singleton": replace(spec, block_size=32),
+        "follower2": spec,
+    }
+    builders = {name: KimiKDAHostMetadataBuilder(s, [name], config, device) for name, s in specs.items()}
+    groups = [
+        [AttentionGroup(None, [name], builder.kv_cache_spec, i, metadata_builders=[builder])]
+        for i, (name, builder) in enumerate(builders.items())
+    ]
+    tables = [torch.zeros((rows, 2 if name == "wide_table" else 1), dtype=torch.int32) for name in builders]
+    slots = torch.zeros((len(groups), rows), dtype=torch.int64)
+
+    capture = create_common_attn_metadata(BatchSpec([64] * rows, [1] * rows), spec.block_size, device)
+    captured = _build_kimi_kda_group_batch(
+        state, capture, groups, tables, slots, rows, CUDAGraphMode.NONE, capture=True
+    )
+    captured_lengths = {
+        name: metadata.non_spec_decode_metadata.actual_seq_lengths for name, metadata in captured.items()
+    }
+    expected = {}
+    versions = {}
+    for i, (name, builder) in enumerate(builders.items()):
+        lengths = builder.non_spec_actual_seq_lengths
+        lengths.fill_(11 + i)
+        expected[name] = lengths.clone()
+        versions[name] = lengths._version
+        owner = "leader" if name.startswith("follower") else name
+        assert captured_lengths[name].data_ptr() == builders[owner].non_spec_actual_seq_lengths.data_ptr()
+
+    pcp = None
+    if path == "pcp":
+        pcp = SimpleNamespace(
+            local_num_tokens=rows,
+            hidden_restore_idx=torch.arange(0),
+            global_batch=SimpleNamespace(num_tokens=0),
+            local_token_indices=torch.arange(0),
+        )
+        pcp.for_attention_group = lambda group: pcp
+    idle = create_common_attn_metadata(BatchSpec([0] * rows, [0] * rows), spec.block_size, device)
+    mode = CUDAGraphMode.NONE if path == "eager" else CUDAGraphMode.FULL
+    result = _build_kimi_kda_group_batch(state, idle, groups, tables, slots, 0, mode, pcp_context=pcp)
+
+    if path == "full":
+        expected["leader"][: rows + 1].zero_()
+    for name, builder in builders.items():
+        assert result[name].non_spec_decode_metadata is None
+        torch.testing.assert_close(builder.non_spec_actual_seq_lengths, expected[name], msg=name)
+        # A second follower clearing the leader again would produce the same values.
+        assert builder.non_spec_actual_seq_lengths._version - versions[name] == int(path == "full" and name == "leader")
+        owner = "leader" if name.startswith("follower") else name
+        torch.testing.assert_close(captured_lengths[name], expected[owner][: rows + 1], msg=name)
+
+
+def test_kimi_kda_incompatible_group_tables_do_not_reuse_metadata():
+    vllm_config = _make_vllm_config(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)
+    spec = MambaSpec(block_size=16, shapes=((1,), (1,)), dtypes=(torch.float32, torch.float32))
+    # Each distinct MambaSpec needs its own original build, even for this single backend.
+    other_spec = replace(spec, block_size=32)
+    specs = [spec, spec, spec, spec, spec, other_spec, other_spec, spec]
+    builders = [
+        KimiKDAHostMetadataBuilder(s, [f"layer{i}"], vllm_config, torch.device("cpu")) for i, s in enumerate(specs)
+    ]
+    groups = [[AttentionGroup(None, [f"layer{i}"], s, i, metadata_builders=[builders[i]])] for i, s in enumerate(specs)]
+    rows = 2
+    tables = [torch.full((rows, 1), i + 1, dtype=torch.int32) for i in range(len(groups))]
+    tables[1] = tables[1].repeat(1, 2)
+    tables[2] = tables[2].repeat(1, 2)[:, :1]
+    tables[3] = tables[3].long()
+    mapped = groups[4][0]
+    mapped.kernel_block_size = spec.block_size // 2
+    mapped.kernel_block_table = torch.empty((1, rows, 2), dtype=torch.int32)
+    mapped.kernel_block_offsets = torch.arange(2, dtype=torch.int32)
+    common = create_common_attn_metadata(BatchSpec([64] * rows, [1] * rows), spec.block_size, torch.device("cpu"))
+    pcp = SimpleNamespace(
+        local_num_tokens=rows,
+        hidden_restore_idx=torch.arange(rows),
+        global_batch=SimpleNamespace(num_tokens=rows),
+        local_token_indices=torch.arange(rows),
+    )
+    pcp.for_attention_group = lambda group: pcp
+    vllm_config.num_speculative_tokens = 0
+    state = SimpleNamespace(vllm_config=vllm_config, max_model_len=64)
+    slots = torch.zeros((len(groups), rows), dtype=torch.int64)
+    for full, context in ((True, None), (False, None), (True, pcp)):
+        share = full and context is None
+        with patch.object(
+            ascend_gdn_attn_builder, "_split_gdn_batch", wraps=ascend_gdn_attn_builder._split_gdn_batch
+        ) as split:
+            result = _build_kimi_kda_group_batch(
+                state,
+                common,
+                groups,
+                tables,
+                slots,
+                rows,
+                CUDAGraphMode.FULL if full else CUDAGraphMode.NONE,
+                pcp_context=context,
+            )
+        # Full replay classifies once per eligible spec plus once per incompatible table.
+        assert split.call_count == (6 if share else len(groups))
+        starts = [result[f"layer{i}"].non_spec_query_start_loc.data_ptr() for i in range(len(groups))]
+        assert (starts[0] == starts[7]) == share
+        assert (starts[5] == starts[6]) == share
+        assert len(set(starts[:6])) == 6
+        for i, table in enumerate(tables):
+            indices = result[f"layer{i}"].non_spec_state_indices_tensor
+            assert indices.tolist() == [2 * (i + 1) if i == 4 else i + 1] * rows
+            assert (indices.data_ptr() == table.data_ptr()) == (share and i in (0, 5, 6, 7))
+            assert result[f"layer{i}"].pcp_context is context
+
+
+@pytest.mark.parametrize("reason", ["speculation", "align", "checkpoint", "eager"])
+def test_kimi_kda_builder_rejects_incompatible_config(reason):
+    mode = CUDAGraphMode.NONE if reason == "eager" else CUDAGraphMode.FULL_DECODE_ONLY
+    config = _make_vllm_config(
+        num_speculative_tokens=int(reason == "speculation"),
+        mamba_cache_mode="align" if reason == "align" else "none",
+        cudagraph_mode=mode,
+    )
+    config.compilation_config.static_forward_context = {
+        "layer": SimpleNamespace(_ascend_internal_checkpoint_enabled=True)
+    }
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,), (1,)),
+        dtypes=(torch.float32, torch.float32),
+        num_prefill_checkpoint_blocks=int(reason == "checkpoint"),
+    )
+    builder = KimiKDAHostMetadataBuilder(spec, ["layer"], config, torch.device("cpu"))
+    assert not builder.supports_update_block_table
 
 
 def _build_attn_metadata(
