@@ -406,6 +406,7 @@ def build_attn_metadata(
     copy_sfa_restore_tails: bool = False,
     draft_layer_names: set[str] | None = None,
     common_metadata_callback=None,
+    reuse_block_table_metadata: bool = False,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -457,6 +458,8 @@ def build_attn_metadata(
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
     attn_metadata: dict[str, Any] = {}
+    # As in upstream MRV2, a template belongs to one build, including capture.
+    cached_metadata: dict[tuple[MambaSpec, type], tuple[Any, Callable[[Any], None] | None]] = {}
     step_metadata_builders: list[tuple[list[str], Any]] = []
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
@@ -637,18 +640,48 @@ def build_attn_metadata(
             for variant_names, variant_common in metadata_variants:
                 if group_pcp_context is not pcp_context:
                     variant_common = replace(variant_common, pcp_context=group_pcp_context)
-                if for_cudagraph_capture:
-                    metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                        attn_group._with_kernel_block_table(variant_common),
-                        **attn_metadata_extra_kwargs,
-                    )
-                else:
-                    if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
-                        attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
-                    metadata = attn_group.build_metadata(
-                        common_prefix_len=0,
-                        common_attn_metadata=variant_common,
-                        **attn_metadata_extra_kwargs,
+                reuse_key = None
+                metadata = None
+                prepare_idle_template = None
+                if (
+                    reuse_block_table_metadata
+                    and getattr(attn_metadata_builder, "supports_update_block_table", False)
+                    and isinstance(attn_group.kv_cache_spec, MambaSpec)
+                    and attn_group.kernel_block_size is None
+                    and hasattr(attn_metadata_builder, "can_update_block_table")
+                ):
+                    reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+                    metadata, prepare_idle_template = cached_metadata.get(reuse_key, (None, None))
+                if metadata is None or not attn_metadata_builder.can_update_block_table(variant_common, metadata):
+                    if for_cudagraph_capture:
+                        metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                            attn_group._with_kernel_block_table(variant_common),
+                            **attn_metadata_extra_kwargs,
+                        )
+                    else:
+                        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+                            attn_metadata_extra_kwargs["num_actual_reqs"] = num_actual_reqs
+                        metadata = attn_group.build_metadata(
+                            common_prefix_len=0,
+                            common_attn_metadata=variant_common,
+                            **attn_metadata_extra_kwargs,
+                        )
+                    if reuse_key is not None and attn_metadata_builder.can_update_block_table(variant_common, metadata):
+                        if num_actual_tokens == 0:
+                            prepare_idle_template = getattr(
+                                attn_metadata_builder, "prepare_idle_metadata_for_reuse", None
+                            )
+                        cached_metadata.setdefault(reuse_key, (metadata, prepare_idle_template))
+                    else:
+                        reuse_key = None
+                elif reuse_key is not None and prepare_idle_template is not None:
+                    # Prepare shared buffers on their owner when the first follower uses the template.
+                    prepare_idle_template(metadata)
+                    cached_metadata[reuse_key] = (metadata, None)
+                if reuse_key is not None:
+                    # Bind the first group's graph inputs exactly as for the followers.
+                    metadata = attn_metadata_builder.update_block_table(
+                        metadata, variant_common.block_table_tensor, variant_common.slot_mapping
                     )
                 if is_dsa_builder:
                     # Preserve sharing even if a builder replaces one of the

@@ -536,4 +536,9 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             pcp_context=pcp_context,
             full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
             for_cudagraph_capture=for_capture,
+            # This path uses one request order and the same gathered table storage
+            # for capture and replay. PCP supplies separate global request metadata.
+            reuse_block_table_metadata=(
+                (for_capture or cudagraph_mode == CUDAGraphMode.FULL) and max_query_len <= 1 and pcp_context is None
+            ),
         )

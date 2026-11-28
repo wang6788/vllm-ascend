@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Ascend Kimi K3 delta attention with TP x PCP head-sharded state."""
 
+from copy import copy
+from dataclasses import replace
 from functools import wraps
 from os import getenv
 
@@ -11,6 +13,7 @@ from einops import rearrange
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import divide, get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
@@ -25,7 +28,7 @@ from vllm.models.kimi_k3.nvidia.kda import (
     _KimiGDNMergedColumnParallelLinear,
     _make_decode_conv1d_weight_loader,
 )
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -220,7 +223,64 @@ def _prepare_beta(
 
 
 class KimiKDAHostMetadataBuilder(PCPRecurrentMetadataBuilderMixin, AscendGDNHostMetadataBuilder):
-    pass
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Other recurrent builders can own per-group checkpoint or speculative state.
+        self.supports_update_block_table = (
+            type(self) is KimiKDAHostMetadataBuilder
+            and self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.speculative_config is None
+            and vllm_config.cache_config.mamba_cache_mode == "none"
+            and not self._ascend_gdn_checkpoints
+        )
+
+    def can_update_block_table(
+        self, common_attn_metadata: CommonAttentionMetadata, metadata: GDNAttentionMetadata
+    ) -> bool:
+        table = common_attn_metadata.block_table_tensor
+        rows = common_attn_metadata.num_reqs
+        layers = getattr(self.compilation_config, "static_forward_context", {})
+        return (
+            metadata.num_prefills == 0
+            and metadata.num_spec_decodes == 0
+            and metadata.num_decodes == metadata.num_decode_tokens == metadata.num_actual_tokens
+            and 0 < rows <= self.decode_cudagraph_max_bs
+            and metadata.non_spec_state_indices_tensor is not None
+            and metadata.non_spec_state_indices_tensor.shape == (rows,)
+            and table.ndim == 2
+            and table.shape[0] >= rows
+            and table.shape[1] == 1
+            and table.dtype == torch.int32
+            and table.device == self.non_spec_state_indices_tensor.device
+            and table.stride(0) == 1
+            and not getattr(layers.get(self._conv_layer_name), "use_shared_conv_output", False)
+        )
+
+    def prepare_idle_metadata_for_reuse(self, metadata: GDNAttentionMetadata) -> None:
+        # The idle descriptor omits lengths, but captured followers still read this buffer.
+        assert metadata.num_decodes == 0 and metadata.non_spec_query_start_loc is not None
+        assert self.non_spec_actual_seq_lengths is not None
+        self.non_spec_actual_seq_lengths[: metadata.non_spec_query_start_loc.numel()].zero_()
+
+    def update_block_table(
+        self, metadata: GDNAttentionMetadata, blk_table: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> GDNAttentionMetadata:
+        # The runner gathers into the same per-group table used at capture and
+        # clears inactive rows to NULL_BLOCK_ID. Both KDA kernels use column 0.
+        assert metadata.num_prefills == 0 and metadata.num_spec_decodes == 0
+        assert metadata.non_spec_state_indices_tensor is not None
+        rows = metadata.non_spec_state_indices_tensor.shape[0]
+        indices = blk_table[:rows, 0]
+        # Ascend attaches its phase descriptors after constructing the upstream
+        # dataclass. Preserve them and leave the source group's fields intact.
+        updated = copy(metadata)
+        updated.non_spec_state_indices_tensor = indices
+        decode = metadata.non_spec_decode_metadata
+        if decode is not None:
+            updated.non_spec_decode_metadata = replace(
+                decode, causal_conv1d=replace(decode.causal_conv1d, cache_indices=indices)
+            )
+        return updated
 
 
 class KimiKDAHostMetadataBackend(AscendGDNHostMetadataBackend):
